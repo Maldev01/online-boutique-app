@@ -4,3 +4,10 @@
 **/obj/
 **/out/
 Dockerfile*
+CartServiceTests.cs
+cartservice_tests.csproj
+*.Tests.cs
+tests
+.git
+.gitignore
+README.md
