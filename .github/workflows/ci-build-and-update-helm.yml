@@ -123,8 +123,8 @@ jobs:
           cache-from: type=registry,ref=${{ steps.ecrinfo.outputs.registry }}/${{ matrix.service }}:cache
           cache-to: type=inline
 
-      - name: Optional: Scan pushed image with Trivy
-        uses: aquasecurity/trivy-action@v0.20.0
+      - name: Scan pushed image with Trivy
+        uses: aquasecurity/trivy-action@0.20.0
         with:
           image-ref: ${{ steps.ecrinfo.outputs.registry }}/${{ matrix.service }}:${{ github.sha }}
           format: table
