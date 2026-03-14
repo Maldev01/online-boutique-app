@@ -134,21 +134,23 @@ jobs:
   update-values:
     needs: build-and-push
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted]
     steps:
       - name: Checkout deployment repo
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.DEPLOYMENT_REPO }}
+          repository: ${{ vars.DEPLOYMENT_REPO }}
           token: ${{ secrets.GITHUB_TOKEN }}
-          ref: ${{ env.DEPLOYMENT_REPO_BRANCH }}
+          ref: ${{ vars.DEPLOYMENT_REPO_BRANCH }}
           path: deploy-repo
+          
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v2
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ secrets.AWS_REGION }}    
+
 
       - name: Compute image repo & tag
         id: imageinfo
@@ -157,10 +159,12 @@ jobs:
           echo "registry=${ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com" >> $GITHUB_OUTPUT
           echo "tag=${GITHUB_SHA}" >> $GITHUB_OUTPUT
 
+
       - name: Install yq
         run: |
           sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
           sudo chmod +x /usr/local/bin/yq
+
 
       - name: Update Helm values (images.repository & images.tag)
         run: |
@@ -174,15 +178,16 @@ jobs:
           echo "Resulting values:"
           sed -n '1,200p' "$FILE"
 
+
       - name: Commit & push changes
         working-directory: deploy-repo
         run: |
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
-          git add ${{ env.DEPLOYMENT_REPO_PATH }}
+          git add ${{ vars.DEPLOYMENT_REPO_PATH }}
           if git diff --cached --quiet; then
             echo "No changes to commit"
           else
             git commit -m "ci: update images.repository and images.tag to ${GITHUB_SHA}"
-            git push origin HEAD:${{ env.DEPLOYMENT_REPO_BRANCH }}
+            git push origin HEAD:${{ vars.DEPLOYMENT_REPO_BRANCH }}
           fi
