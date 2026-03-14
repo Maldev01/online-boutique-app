@@ -1,5 +1,4 @@
 name: CI - build, scan, push, update-deploy
-
 on:
   push:
     branches: [ main ]
