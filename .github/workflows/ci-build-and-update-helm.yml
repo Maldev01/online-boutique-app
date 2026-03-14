@@ -3,38 +3,89 @@ name: CI - build, scan, push, update-deploy
 on:
   push:
     branches: [ main ]
-  workflow_dispatch:
+  workflow_dispatch:  
+
+  # pull_request:
 
 permissions:
   id-token: write
   contents: read
+  packages: write
 
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
-  DEPLOYMENT_REPO: ${{ secrets.DEPLOYMENT_REPO }}
-  DEPLOYMENT_REPO_BRANCH: ${{ secrets.DEPLOYMENT_REPO_BRANCH }}
-  DEPLOYMENT_REPO_PATH: ${{ secrets.DEPLOYMENT_REPO_PATH }}
 
 jobs:
-  build-and-push:
+  detect-changes:
+    name: detect changed services
     runs-on: [self-hosted]
+    outputs:
+      services: ${{ steps.set-matrix.outputs.services }}
+    steps:
+      - name: Checkout repo (full history for diff)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute changed services vs origin/main
+        id: set-matrix
+        run: |
+          set -euo pipefail
+
+          # list all services you want CI to consider (adjust to your repo)
+          SERVICES=(frontend productcatalogservice cartservice checkoutservice currencyservice emailservice paymentservice recommendationservice shippingservice adservice shoppingassistantservice)
+
+          # ensure origin/main exists
+          git remote set-url origin "$(git config --get remote.origin.url)"
+          git fetch origin main --depth=1 || true
+
+          # compute changed files against origin/main (works for push & PR)
+          # For PRs you might want to compare to base ref instead:
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_REF="${{ github.event.pull_request.base.ref }}"
+            echo "PR detected, comparing against $BASE_REF"
+            git fetch origin ${BASE_REF} --depth=1 || true
+            CHANGED_FILES=$(git diff --name-only origin/${BASE_REF}...HEAD)
+          else
+            CHANGED_FILES=$(git diff --name-only origin/main...HEAD)
+          fi
+
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+
+          # build JSON array of services that have changes
+          arr=()
+          for s in "${SERVICES[@]}"; do
+            if printf '%s\n' "$CHANGED_FILES" | grep -qE "^src/${s}/|^${s}/|^helm-chart/|^charts/online-boutique/"; then
+              arr+=("\"${s}\"")
+            fi
+          done
+
+          if [ ${#arr[@]} -eq 0 ]; then
+            echo "No service directories changed — nothing to build"
+            echo "services=[]" >> "$GITHUB_OUTPUT"
+          else
+            JSON="[${arr[*]}]"
+            echo "Detected services: $JSON"
+            echo "services=$JSON" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-and-push:
+    name: Build & push changed images
+    runs-on: [self-hosted]
+    needs: detect-changes
+    # skip if no services changed
+    if: ${{ needs.detect-changes.outputs.services != '[]' }}
     strategy:
+      fail-fast: false
       matrix:
-        service:
-          - frontend
-          - productcatalogservice
-          - cartservice
-          - checkoutservice
-          - currencyservice
-          - emailservice
-          - paymentservice
-          - recommendationservice
-          - shippingservice
-          - adservice
-          - shoppingassistantservice
+        service: ${{ fromJson(needs.detect-changes.outputs.services) }}
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v2
@@ -46,19 +97,7 @@ jobs:
         id: ecrinfo
         run: |
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          echo "account=${ACCOUNT_ID}" >> $GITHUB_OUTPUT
           echo "registry=${ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com" >> $GITHUB_OUTPUT
-
-      - name: Ensure ECR repository exists
-        run: |
-          SERVICE=${{ matrix.service }}
-          REG=${{ steps.ecrinfo.outputs.registry }}
-          if ! aws ecr describe-repositories --repository-names "${SERVICE}" --region ${AWS_REGION} >/dev/null 2>&1; then
-            echo "Creating ECR repo ${SERVICE}"
-            aws ecr create-repository --repository-name "${SERVICE}" --region ${AWS_REGION}
-          else
-            echo "ECR repo ${SERVICE} exists"
-          fi
 
       - name: Login to ECR
         uses: aws-actions/amazon-ecr-login@v1
@@ -68,6 +107,8 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-flags: --allow-insecure-entitlements security.insecure
 
       - name: Build and push image (matrix)
         id: buildpush
@@ -79,9 +120,11 @@ jobs:
           tags: |
             ${{ steps.ecrinfo.outputs.registry }}/${{ matrix.service }}:${{ github.sha }}
             ${{ steps.ecrinfo.outputs.registry }}/${{ matrix.service }}:latest
+          cache-from: type=registry,ref=${{ steps.ecrinfo.outputs.registry }}/${{ matrix.service }}:cache
+          cache-to: type=inline
 
-      - name: Scan pushed image with Trivy
-        uses: aquasecurity/trivy-action@0.20.0
+      - name: Optional: Scan pushed image with Trivy
+        uses: aquasecurity/trivy-action@v0.20.0
         with:
           image-ref: ${{ steps.ecrinfo.outputs.registry }}/${{ matrix.service }}:${{ github.sha }}
           format: table
