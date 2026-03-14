@@ -81,13 +81,12 @@ jobs:
             ${{ steps.ecrinfo.outputs.registry }}/${{ matrix.service }}:latest
 
       - name: Scan pushed image with Trivy
-        env:
-          IMAGE_URI: ${{ steps.ecrinfo.outputs.registry }}/${{ matrix.service }}:${{ github.sha }}
-        run: |
-          sudo apt-get update && sudo apt-get install -y wget ca-certificates
-          wget -qO- https://github.com/aquasecurity/trivy/releases/latest/download/trivy_$(uname -s)_64.tar.gz | tar xz -C /tmp
-          sudo mv /tmp/trivy /usr/local/bin/trivy
-          trivy image --severity HIGH,CRITICAL --exit-code 1 $IMAGE_URI || echo "Trivy found issues (see above)"
+        uses: aquasecurity/trivy-action@0.20.0
+        with:
+          image-ref: ${{ steps.ecrinfo.outputs.registry }}/${{ matrix.service }}:${{ github.sha }}
+          format: table
+          exit-code: 0
+          severity: CRITICAL,HIGH
 
   update-values:
     needs: build-and-push
