@@ -164,10 +164,13 @@ jobs:
 
       - name: Update Helm values (images.repository & images.tag)
         run: |
-          FILE="deploy-repo/helm-chart/values.yml${{ env.DEPLOYMENT_REPO_PATH }}"
+          FILE="deploy-repo/helm-chart/values.yaml"
+
           cp "$FILE" "${FILE}.bak"
+
           yq eval -i ".images.repository = \"${{ steps.imageinfo.outputs.registry }}\"" "$FILE"
           yq eval -i ".images.tag = \"${{ steps.imageinfo.outputs.tag }}\"" "$FILE"
+
           echo "Resulting values:"
           sed -n '1,200p' "$FILE"
 
