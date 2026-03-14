@@ -1,135 +1,135 @@
-name: CI - build, scan, push, update-deploy
+# name: CI - build, scan, push, update-deploy
 
-on:
-  push:
-    branches: [ main ]
-  workflow_dispatch:
+# on:
+#   push:
+#     branches: [ main ]
+#   workflow_dispatch:
 
-permissions:
-  id-token: write
-  contents: read
+# permissions:
+#   id-token: write
+#   contents: read
 
-env:
-  AWS_REGION: ${{ secrets.AWS_REGION }}
-  DEPLOYMENT_REPO: ${{ secrets.DEPLOYMENT_REPO }}
-  DEPLOYMENT_REPO_BRANCH: ${{ secrets.DEPLOYMENT_REPO_BRANCH }}
-  DEPLOYMENT_REPO_PATH: ${{ secrets.DEPLOYMENT_REPO_PATH }}
+# env:
+#   AWS_REGION: ${{ secrets.AWS_REGION }}
+#   DEPLOYMENT_REPO: ${{ secrets.DEPLOYMENT_REPO }}
+#   DEPLOYMENT_REPO_BRANCH: ${{ secrets.DEPLOYMENT_REPO_BRANCH }}
+#   DEPLOYMENT_REPO_PATH: ${{ secrets.DEPLOYMENT_REPO_PATH }}
 
-jobs:
-  build-and-push:
-    runs-on: [self-hosted]
-    strategy:
-      matrix:
-        service:
-          - frontend
-          - productcatalogservice
-          - cartservice
-          - checkoutservice
-          - currencyservice
-          - emailservice
-          - paymentservice
-          - recommendationservice
-          - shippingservice
-          - adservice
-          - shoppingassistantservice
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+# jobs:
+#   build-and-push:
+#     runs-on: [self-hosted]
+#     strategy:
+#       matrix:
+#         service:
+#           - frontend
+#           - productcatalogservice
+#           - cartservice
+#           - checkoutservice
+#           - currencyservice
+#           - emailservice
+#           - paymentservice
+#           - recommendationservice
+#           - shippingservice
+#           - adservice
+#           - shoppingassistantservice
+#     steps:
+#       - name: Checkout code
+#         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials via OIDC
-        uses: aws-actions/configure-aws-credentials@v2
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
+#       - name: Configure AWS credentials via OIDC
+#         uses: aws-actions/configure-aws-credentials@v2
+#         with:
+#           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+#           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Compute ECR registry
-        id: ecrinfo
-        run: |
-          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          echo "account=${ACCOUNT_ID}" >> $GITHUB_OUTPUT
-          echo "registry=${ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com" >> $GITHUB_OUTPUT
+#       - name: Compute ECR registry
+#         id: ecrinfo
+#         run: |
+#           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+#           echo "account=${ACCOUNT_ID}" >> $GITHUB_OUTPUT
+#           echo "registry=${ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com" >> $GITHUB_OUTPUT
 
-      - name: Ensure ECR repository exists
-        run: |
-          SERVICE=${{ matrix.service }}
-          REG=${{ steps.ecrinfo.outputs.registry }}
-          if ! aws ecr describe-repositories --repository-names "${SERVICE}" --region ${AWS_REGION} >/dev/null 2>&1; then
-            echo "Creating ECR repo ${SERVICE}"
-            aws ecr create-repository --repository-name "${SERVICE}" --region ${AWS_REGION}
-          else
-            echo "ECR repo ${SERVICE} exists"
-          fi
+#       - name: Ensure ECR repository exists
+#         run: |
+#           SERVICE=${{ matrix.service }}
+#           REG=${{ steps.ecrinfo.outputs.registry }}
+#           if ! aws ecr describe-repositories --repository-names "${SERVICE}" --region ${AWS_REGION} >/dev/null 2>&1; then
+#             echo "Creating ECR repo ${SERVICE}"
+#             aws ecr create-repository --repository-name "${SERVICE}" --region ${AWS_REGION}
+#           else
+#             echo "ECR repo ${SERVICE} exists"
+#           fi
 
-      - name: Login to ECR
-        uses: aws-actions/amazon-ecr-login@v1
+#       - name: Login to ECR
+#         uses: aws-actions/amazon-ecr-login@v1
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v2
+#       - name: Set up QEMU
+#         uses: docker/setup-qemu-action@v2
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+#       - name: Set up Docker Buildx
+#         uses: docker/setup-buildx-action@v3
 
-      - name: Build and push image (matrix)
-        id: buildpush
-        uses: docker/build-push-action@v4
-        with:
-          context: ./src/${{ matrix.service }}
-          file: ./src/${{ matrix.service }}/Dockerfile
-          push: true
-          tags: |
-            ${{ steps.ecrinfo.outputs.registry }}/${{ matrix.service }}:${{ github.sha }}
-            ${{ steps.ecrinfo.outputs.registry }}/${{ matrix.service }}:latest
+#       - name: Build and push image (matrix)
+#         id: buildpush
+#         uses: docker/build-push-action@v4
+#         with:
+#           context: ./src/${{ matrix.service }}
+#           file: ./src/${{ matrix.service }}/Dockerfile
+#           push: true
+#           tags: |
+#             ${{ steps.ecrinfo.outputs.registry }}/${{ matrix.service }}:${{ github.sha }}
+#             ${{ steps.ecrinfo.outputs.registry }}/${{ matrix.service }}:latest
 
-      - name: Scan pushed image with Trivy
-        uses: aquasecurity/trivy-action@0.20.0
-        with:
-          image-ref: ${{ steps.ecrinfo.outputs.registry }}/${{ matrix.service }}:${{ github.sha }}
-          format: table
-          exit-code: 0
-          severity: CRITICAL,HIGH
+#       - name: Scan pushed image with Trivy
+#         uses: aquasecurity/trivy-action@0.20.0
+#         with:
+#           image-ref: ${{ steps.ecrinfo.outputs.registry }}/${{ matrix.service }}:${{ github.sha }}
+#           format: table
+#           exit-code: 0
+#           severity: CRITICAL,HIGH
 
-  update-values:
-    needs: build-and-push
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout deployment repo
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.DEPLOYMENT_REPO }}
-          token: ${{ secrets.DEPLOYMENT_REPO_PAT }}
-          ref: ${{ env.DEPLOYMENT_REPO_BRANCH }}
-          path: deploy-repo
+#   update-values:
+#     needs: build-and-push
+#     runs-on: ubuntu-latest
+#     steps:
+#       - name: Checkout deployment repo
+#         uses: actions/checkout@v4
+#         with:
+#           repository: ${{ env.DEPLOYMENT_REPO }}
+#           token: ${{ secrets.DEPLOYMENT_REPO_PAT }}
+#           ref: ${{ env.DEPLOYMENT_REPO_BRANCH }}
+#           path: deploy-repo
 
-      - name: Compute image repo & tag
-        id: imageinfo
-        run: |
-          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          echo "registry=${ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com" >> $GITHUB_OUTPUT
-          echo "tag=${GITHUB_SHA}" >> $GITHUB_OUTPUT
+#       - name: Compute image repo & tag
+#         id: imageinfo
+#         run: |
+#           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+#           echo "registry=${ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com" >> $GITHUB_OUTPUT
+#           echo "tag=${GITHUB_SHA}" >> $GITHUB_OUTPUT
 
-      - name: Install yq
-        run: |
-          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
-          sudo chmod +x /usr/local/bin/yq
+#       - name: Install yq
+#         run: |
+#           sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+#           sudo chmod +x /usr/local/bin/yq
 
-      - name: Update Helm values (images.repository & images.tag)
-        run: |
-          FILE="deploy-repo/${{ env.DEPLOYMENT_REPO_PATH }}"
-          cp "$FILE" "${FILE}.bak"
-          yq eval -i ".images.repository = \"${{ steps.imageinfo.outputs.registry }}\"" "$FILE"
-          yq eval -i ".images.tag = \"${{ steps.imageinfo.outputs.tag }}\"" "$FILE"
-          echo "Resulting values:"
-          sed -n '1,200p' "$FILE"
+#       - name: Update Helm values (images.repository & images.tag)
+#         run: |
+#           FILE="deploy-repo/${{ env.DEPLOYMENT_REPO_PATH }}"
+#           cp "$FILE" "${FILE}.bak"
+#           yq eval -i ".images.repository = \"${{ steps.imageinfo.outputs.registry }}\"" "$FILE"
+#           yq eval -i ".images.tag = \"${{ steps.imageinfo.outputs.tag }}\"" "$FILE"
+#           echo "Resulting values:"
+#           sed -n '1,200p' "$FILE"
 
-      - name: Commit & push changes
-        working-directory: deploy-repo
-        run: |
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git config user.name "github-actions[bot]"
-          git add ${{ env.DEPLOYMENT_REPO_PATH }}
-          if git diff --cached --quiet; then
-            echo "No changes to commit"
-          else
-            git commit -m "ci: update images.repository and images.tag to ${GITHUB_SHA}"
-            git push origin HEAD:${{ env.DEPLOYMENT_REPO_BRANCH }}
-          fi
+#       - name: Commit & push changes
+#         working-directory: deploy-repo
+#         run: |
+#           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+#           git config user.name "github-actions[bot]"
+#           git add ${{ env.DEPLOYMENT_REPO_PATH }}
+#           if git diff --cached --quiet; then
+#             echo "No changes to commit"
+#           else
+#             git commit -m "ci: update images.repository and images.tag to ${GITHUB_SHA}"
+#             git push origin HEAD:${{ env.DEPLOYMENT_REPO_BRANCH }}
+#           fi
