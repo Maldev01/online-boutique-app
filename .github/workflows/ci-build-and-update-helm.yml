@@ -133,6 +133,7 @@ jobs:
 
   update-values:
     needs: build-and-push
+    if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Checkout deployment repo
@@ -175,5 +176,4 @@ jobs:
           else
             git commit -m "ci: update images.repository and images.tag to ${GITHUB_SHA}"
             git push origin HEAD:${{ env.DEPLOYMENT_REPO_BRANCH }}
-            
           fi
