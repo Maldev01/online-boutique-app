@@ -198,3 +198,4 @@ jobs:
             git commit -m "ci: update images.repository and images.tag to ${GITHUB_SHA}"
             git push https://x-access-token:${{ secrets.GITOPS_TOKEN }}@github.com/Maldev01/online-boutique-gitops.git HEAD:main
           fi
+          
