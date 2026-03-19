@@ -33,7 +33,7 @@ jobs:
           set -euo pipefail
 
           # list all services you want CI to consider (adjust to your repo)
-          SERVICES=(frontend productcatalogservice cartservice checkoutservice currencyservice emailservice paymentservice recommendationservice shippingservice adservice shoppingassistantservice)
+          SERVICES=(frontend productcatalogservice loadgenerator cartservice checkoutservice currencyservice emailservice paymentservice recommendationservice shippingservice adservice shoppingassistantservice)
 
           # ensure origin/main exists
           git remote set-url origin "$(git config --get remote.origin.url)"
