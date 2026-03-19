@@ -1,200 +1,153 @@
-name: CI - build, scan, push, update-deploy
+name: Online Boutique CI Pipeline
 
 on:
   push:
-    branches: [ main ]
-  workflow_dispatch:  
-
-  # pull_request:
-
-permissions:
-  id-token: write
-  contents: read
-  packages: write
+    branches:
+      - main
 
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REGISTRY: 307857433476.dkr.ecr.us-east-1.amazonaws.com
 
 jobs:
+
+# 🔍 1. Detect Changed Services
   detect-changes:
-    name: detect changed services
-    runs-on: [self-hosted]
+    runs-on: ubuntu-latest
     outputs:
       services: ${{ steps.set-matrix.outputs.services }}
-    steps:
-      - name: Checkout repo (full history for diff)
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Compute changed services vs origin/main
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Get changed services
         id: set-matrix
         run: |
-          set -euo pipefail
+          SERVICES=$(git diff --name-only HEAD~1 HEAD | cut -d/ -f1 | sort -u | jq -R -s -c 'split("\n")[:-1]')
+          echo "Detected services: $SERVICES"
+          echo "services=$SERVICES" >> $GITHUB_OUTPUT
 
-          # list all services you want CI to consider (adjust to your repo)
-          SERVICES=(frontend productcatalogservice loadgenerator cartservice checkoutservice currencyservice emailservice paymentservice recommendationservice shippingservice adservice shoppingassistantservice)
-
-          # ensure origin/main exists
-          git remote set-url origin "$(git config --get remote.origin.url)"
-          git fetch origin main --depth=1 || true
-
-          # compute changed files against origin/main (works for push & PR)
-          # For PRs you might want to compare to base ref instead:
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            BASE_REF="${{ github.event.pull_request.base.ref }}"
-            echo "PR detected, comparing against $BASE_REF"
-            git fetch origin ${BASE_REF} --depth=1 || true
-            CHANGED_FILES=$(git diff --name-only origin/${BASE_REF}...HEAD)
-          else
-            CHANGED_FILES=$(git diff --name-only origin/main...HEAD)
-          fi
-
-          echo "Changed files:"
-          echo "$CHANGED_FILES"
-
-          # build JSON array of services that have changes
-          arr=()
-          for s in "${SERVICES[@]}"; do
-            if printf '%s\n' "$CHANGED_FILES" | grep -qE "^src/${s}/|^${s}/|^helm-chart/|^charts/online-boutique/"; then
-              arr+=("\"${s}\"")
-            fi
-          done
-
-          if [ ${#arr[@]} -eq 0 ]; then
-            echo "No service directories changed — nothing to build"
-            echo "services=[]" >> "$GITHUB_OUTPUT"
-          else
-            JSON="[${arr[*]}]"
-            echo "Detected services: $JSON"
-            echo "services=$JSON" >> "$GITHUB_OUTPUT"
-          fi
-
+# 🐳 2. Build & Push Images to ECR
   build-and-push:
-    name: Build & push changed images
-    runs-on: [self-hosted]
     needs: detect-changes
-    # skip if no services changed
     if: ${{ needs.detect-changes.outputs.services != '[]' }}
+    runs-on: ubuntu-latest
+
     strategy:
-      fail-fast: false
       matrix:
         service: ${{ fromJson(needs.detect-changes.outputs.services) }}
 
     steps:
-      - name: Checkout code
+      - name: Checkout repo
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
-      - name: Configure AWS credentials via OIDC
-        uses: aws-actions/configure-aws-credentials@v2
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Compute ECR registry
-        id: ecrinfo
-        run: |
-          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          echo "registry=${ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com" >> $GITHUB_OUTPUT
+          aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Login to ECR
-        uses: aws-actions/amazon-ecr-login@v1
+        run: |
+          aws ecr get-login-password --region $AWS_REGION \
+          | docker login --username AWS --password-stdin $ECR_REGISTRY
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v2
+      - name: Build & Push Image
+        run: |
+          SERVICE=${{ matrix.service }}
+          TAG=${{ github.sha }}
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-        with:
-          buildkitd-flags: --allow-insecure-entitlements security.insecure
+          echo "Building $SERVICE with tag $TAG"
 
-      - name: Build and push image (matrix)
-        id: buildpush
-        uses: docker/build-push-action@v4
-        with:
-          context: ./src/${{ matrix.service }}
-          file: ./src/${{ matrix.service }}/Dockerfile
-          push: true
-          tags: |
-            ${{ steps.ecrinfo.outputs.registry }}/${{ matrix.service }}:${{ github.sha }}
-            ${{ steps.ecrinfo.outputs.registry }}/${{ matrix.service }}:latest
-          cache-from: type=registry,ref=${{ steps.ecrinfo.outputs.registry }}/${{ matrix.service }}:cache
-          cache-to: type=inline
+          docker build -t $ECR_REGISTRY/$SERVICE:$TAG ./$SERVICE
+          docker push $ECR_REGISTRY/$SERVICE:$TAG
 
-      - name: Scan pushed image with Trivy
-        uses: aquasecurity/trivy-action@0.20.0
-        with:
-          image-ref: ${{ steps.ecrinfo.outputs.registry }}/${{ matrix.service }}:${{ github.sha }}
-          format: table
-          exit-code: 0
-          severity: CRITICAL,HIGH
-
+# 🔁 3. Update GitOps Repo (Per-Service Tag)
   update-values:
-    needs: build-and-push
-    if: always()
-    runs-on: [self-hosted]
+    needs: [detect-changes, build-and-push]
+    if: ${{ needs.build-and-push.result == 'success' && needs.detect-changes.outputs.services != '[]' }}
+    runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout deployment repo
+      - name: Checkout GitOps repo
         uses: actions/checkout@v4
         with:
           repository: ${{ vars.DEPLOYMENT_REPO }}
-          token: ${{ secrets.GITOPS_TOKEN }}
           ref: ${{ vars.DEPLOYMENT_REPO_BRANCH }}
+          token: ${{ secrets.GITOPS_TOKEN }}
           path: deploy-repo
 
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ secrets.AWS_REGION }}    
-
-
-      - name: Compute image repo & tag
-        id: imageinfo
+      - name: Install tools
         run: |
-          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          echo "registry=${ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com" >> $GITHUB_OUTPUT
-          echo "tag=${GITHUB_SHA}" >> $GITHUB_OUTPUT
+          sudo apt-get update
+          sudo apt-get install -y jq
+          sudo wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/bin/yq
+          sudo chmod +x /usr/bin/yq
 
-
-      - name: Install yq
+      - name: Update image tags per service
+        working-directory: deploy-repo
         run: |
-          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
-          sudo chmod +x /usr/local/bin/yq
+          TAG=${{ github.sha }}
+          SERVICES='${{ needs.detect-changes.outputs.services }}'
+          FILE=${{ vars.DEPLOYMENT_REPO_PATH }}
 
+          echo "Updating services: $SERVICES"
 
-      - name: Debug repo structure
-        run: |
-           echo "Listing deploy-repo contents:"
-           ls -R deploy-repo
+          for SERVICE in $(echo $SERVICES | jq -r '.[]'); do
+            echo "Processing $SERVICE"
 
+            case $SERVICE in
+              adservice)
+                yq e ".adService.image.tag = \"$TAG\"" -i $FILE
+                ;;
+              cartservice)
+                yq e ".cartService.image.tag = \"$TAG\"" -i $FILE
+                ;;
+              checkoutservice)
+                yq e ".checkoutService.image.tag = \"$TAG\"" -i $FILE
+                ;;
+              currencyservice)
+                yq e ".currencyService.image.tag = \"$TAG\"" -i $FILE
+                ;;
+              emailservice)
+                yq e ".emailService.image.tag = \"$TAG\"" -i $FILE
+                ;;
+              frontend)
+                yq e ".frontend.image.tag = \"$TAG\"" -i $FILE
+                ;;
+              loadgenerator)
+                yq e ".loadGenerator.image.tag = \"$TAG\"" -i $FILE
+                ;;
+              paymentservice)
+                yq e ".paymentService.image.tag = \"$TAG\"" -i $FILE
+                ;;
+              productcatalogservice)
+                yq e ".productCatalogService.image.tag = \"$TAG\"" -i $FILE
+                ;;
+              recommendationservice)
+                yq e ".recommendationService.image.tag = \"$TAG\"" -i $FILE
+                ;;
+              shippingservice)
+                yq e ".shippingService.image.tag = \"$TAG\"" -i $FILE
+                ;;
+              *)
+                echo "Skipping unknown service: $SERVICE"
+                ;;
+            esac
+          done
 
-      - name: Update Helm values (images.repository & images.tag)
-        run: |
-          FILE="deploy-repo/helm-chart/values.yaml"
-
-          cp "$FILE" "${FILE}.bak"
-
-          yq eval -i ".images.repository = \"${{ steps.imageinfo.outputs.registry }}\"" "$FILE"
-          yq eval -i ".images.tag = \"${{ steps.imageinfo.outputs.tag }}\"" "$FILE"
-
-          echo "Resulting values:"
-          sed -n '1,200p' "$FILE"
-
-
-      - name: Commit & push changes
+      - name: Commit and push changes
         working-directory: deploy-repo
         run: |
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
+
           git add ${{ vars.DEPLOYMENT_REPO_PATH }}
+
           if git diff --cached --quiet; then
             echo "No changes to commit"
-
           else
-            git commit -m "ci: update images.repository and images.tag to ${GITHUB_SHA}"
-            git push https://x-access-token:${{ secrets.GITOPS_TOKEN }}@github.com/Maldev01/online-boutique-gitops.git HEAD:main
+            git commit -m "Update image tags to ${{ github.sha }}"
+            git push origin ${{ vars.DEPLOYMENT_REPO_BRANCH }}
           fi
