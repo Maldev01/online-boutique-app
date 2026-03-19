@@ -20,11 +20,16 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-
+        with:
+          fetch-depth: 2
       - name: Get changed services
         id: set-matrix
         run: |
-          SERVICES=$(git diff --name-only HEAD~1 HEAD | cut -d/ -f1 | sort -u | jq -R -s -c 'split("\n")[:-1]')
+          SERVICES=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }} \
+            | cut -d/ -f1 \
+            | sort -u \
+            | jq -R -s -c 'split("\n")[:-1]')
+
           echo "Detected services: $SERVICES"
           echo "services=$SERVICES" >> $GITHUB_OUTPUT
 
