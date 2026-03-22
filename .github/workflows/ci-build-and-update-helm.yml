@@ -5,6 +5,12 @@ on:
     branches:
       - main
 
+permissions:
+  id-token: write
+  contents: read
+  packages: write
+      
+
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
   ECR_REGISTRY: 307857433476.dkr.ecr.us-east-1.amazonaws.com
@@ -25,13 +31,22 @@ jobs:
       - name: Get changed services
         id: set-matrix
         run: |
-          SERVICES=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }} \
-            | cut -d/ -f1 \
-            | sort -u \
-            | jq -R -s -c 'split("\n")[:-1]')
+          ALL_SERVICES=("adservice" "cartservice" "checkoutservice" "currencyservice" "emailservice" "frontend" "loadgenerator" "paymentservice" "productcatalogservice" "recommendationservice" "shippingservice")
 
-          echo "Detected services: $SERVICES"
-          echo "services=$SERVICES" >> $GITHUB_OUTPUT
+          CHANGED_FILES=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }})
+
+          SERVICES=()
+
+          for SERVICE in "${ALL_SERVICES[@]}"; do
+          if echo "$CHANGED_FILES" | grep -q "^$SERVICE/"; then
+          SERVICES+=("\"$SERVICE\"")
+          fi
+          done
+
+          JSON=$(printf '[%s]' "$(IFS=,; echo "${SERVICES[*]}")")
+
+          echo "Detected services: $JSON"
+          echo "services=$JSON" >> $GITHUB_OUTPUT
 
 # 🐳 2. Build & Push Images to ECR
   build-and-push:
