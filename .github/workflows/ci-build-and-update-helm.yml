@@ -5,6 +5,10 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      service_name:
+        required: false
+        type: string
 
 permissions:
   id-token: write
@@ -16,80 +20,81 @@ env:
   ECR_REGISTRY: 307857433476.dkr.ecr.us-east-1.amazonaws.com
 
 jobs:
-
-# 🔍 1. Detect Changed + New Services
   detect-changes:
     runs-on: [self-hosted]
     outputs:
-      services: ${{ steps.set-matrix.outputs.services }}
+      services: ${{ steps.detect.outputs.services }}
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # full history (important)
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          fetch-depth: 0
 
       - name: Detect services dynamically
-        id: set-matrix
+        id: detect
+        shell: bash
         run: |
-          echo "🔍 Detecting services..."
+          set -euo pipefail
 
-          # Changed + new files
-          CHANGED_FILES=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }})
-          NEW_FILES=$(git diff --name-only --diff-filter=A ${{ github.event.before }} ${{ github.sha }})
+          # Manual test mode
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ inputs.service_name }}" ]]; then
+            SERVICE="${{ inputs.service_name }}"
+
+            if [[ -f "src/${SERVICE}/Dockerfile" ]]; then
+              JSON="[\"${SERVICE}\"]"
+              echo "Detected services: $JSON"
+              echo "services=$JSON" >> "$GITHUB_OUTPUT"
+              exit 0
+            else
+              echo "ERROR: src/${SERVICE}/Dockerfile not found"
+              exit 1
+            fi
+          fi
+
+          BEFORE="${{ github.event.before }}"
+          AFTER="${{ github.sha }}"
+
+          echo "Detecting services between $BEFORE and $AFTER"
+
+          if [[ "$BEFORE" == "0000000000000000000000000000000000000000" ]]; then
+            CHANGED_FILES=$(git ls-files 'src/*/*')
+          else
+            CHANGED_FILES=$(git diff --name-only "$BEFORE" "$AFTER")
+          fi
 
           echo "Changed files:"
           echo "$CHANGED_FILES"
 
-          echo "New files:"
-          echo "$NEW_FILES"
+          # Get unique service names from paths like src/<service>/...
+          mapfile -t CANDIDATES < <(
+            printf '%s\n' "$CHANGED_FILES" \
+              | awk -F/ '$1=="src" && NF>=3 {print $2}' \
+              | sort -u
+          )
 
           SERVICES=()
-
-          # Extract top-level directories
-          ALL_DIRS=$(echo "$CHANGED_FILES $NEW_FILES" | tr ' ' '\n' | cut -d/ -f1 | sort -u)
-
-          for DIR in $ALL_DIRS; do
-            # Skip invalid folders
-            if [[ "$DIR" == ".github" || "$DIR" == "" || "$DIR" == "README.md" ]]; then
-              continue
-            fi
-
-            # Check if valid service (Dockerfile exists)
-            if [ -f "$DIR/Dockerfile" ]; then
-              SERVICES+=("\"$DIR\"")
+          for SERVICE in "${CANDIDATES[@]}"; do
+            if [[ -f "src/${SERVICE}/Dockerfile" ]]; then
+              SERVICES+=("$SERVICE")
             fi
           done
 
-          # 🔥 Ensure build if image missing in ECR
-          for DIR in $ALL_DIRS; do
-            if [ -f "$DIR/Dockerfile" ]; then
-              if ! aws ecr describe-images --repository-name $DIR --region $AWS_REGION > /dev/null 2>&1; then
-                echo "⚠️ Missing image in ECR → forcing build for $DIR"
-                SERVICES+=("\"$DIR\"")
-              fi
+          JSON='['
+          first=true
+          for SERVICE in "${SERVICES[@]}"; do
+            if [[ "$first" == true ]]; then
+              JSON+="\"${SERVICE}\""
+              first=false
+            else
+              JSON+=",\"${SERVICE}\""
             fi
           done
+          JSON+=']'
 
-          # Remove duplicates
-          UNIQUE=$(printf "%s\n" "${SERVICES[@]}" | sort -u | tr '\n' ',' | sed 's/,$//')
+          echo "Detected services: $JSON"
+          echo "services=$JSON" >> "$GITHUB_OUTPUT"
 
-          if [ -z "$UNIQUE" ]; then
-            JSON="[]"
-          else
-            JSON="[$UNIQUE]"
-          fi
-
-          echo "✅ Final detected services: $JSON"
-          echo "services=$JSON" >> $GITHUB_OUTPUT
-
-# 🐳 2. Build & Push Images
   build-and-push:
     needs: detect-changes
     if: ${{ needs.detect-changes.outputs.services != '[]' }}
@@ -110,21 +115,23 @@ jobs:
           aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Login to ECR
+        shell: bash
         run: |
-          aws ecr get-login-password --region $AWS_REGION \
-          | docker login --username AWS --password-stdin $ECR_REGISTRY
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
-      - name: Build & Push Image
+      - name: Build and push image
+        shell: bash
         run: |
-          SERVICE=${{ matrix.service }}
-          TAG=${{ github.sha }}
+          set -euo pipefail
+          SERVICE="${{ matrix.service }}"
+          TAG="${{ github.sha }}"
 
-          echo "🚀 Building $SERVICE with tag $TAG"
+          echo "Building ${SERVICE} with tag ${TAG}"
 
-          docker build -t $ECR_REGISTRY/$SERVICE:$TAG ./$SERVICE
-          docker push $ECR_REGISTRY/$SERVICE:$TAG
+          docker build -t "$ECR_REGISTRY/$SERVICE:$TAG" "./src/$SERVICE"
+          docker push "$ECR_REGISTRY/$SERVICE:$TAG"
 
-# 🔁 3. Update GitOps Repo
   update-values:
     needs: [detect-changes, build-and-push]
     if: ${{ needs.build-and-push.result == 'success' && needs.detect-changes.outputs.services != '[]' }}
@@ -140,6 +147,7 @@ jobs:
           path: deploy-repo
 
       - name: Install tools
+        shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install -y jq
@@ -147,56 +155,58 @@ jobs:
           sudo chmod +x /usr/bin/yq
 
       - name: Update image tags per service
+        shell: bash
         working-directory: deploy-repo
         run: |
-          TAG=${{ github.sha }}
+          set -euo pipefail
+
+          TAG="${{ github.sha }}"
           SERVICES='${{ needs.detect-changes.outputs.services }}'
-          FILE=${{ vars.DEPLOYMENT_REPO_PATH }}
+          FILE="${{ vars.DEPLOYMENT_REPO_PATH }}"
 
           echo "Updating services: $SERVICES"
 
-          for SERVICE in $(echo $SERVICES | jq -r '.[]'); do
-            echo "🔧 Updating $SERVICE"
+          while IFS= read -r SERVICE; do
+            [[ -z "$SERVICE" ]] && continue
 
-            case $SERVICE in
-              adservice)
-                yq e ".adService.image.tag = \"$TAG\"" -i $FILE ;;
-              cartservice)
-                yq e ".cartService.image.tag = \"$TAG\"" -i $FILE ;;
-              checkoutservice)
-                yq e ".checkoutService.image.tag = \"$TAG\"" -i $FILE ;;
-              currencyservice)
-                yq e ".currencyService.image.tag = \"$TAG\"" -i $FILE ;;
-              emailservice)
-                yq e ".emailService.image.tag = \"$TAG\"" -i $FILE ;;
-              frontend)
-                yq e ".frontend.image.tag = \"$TAG\"" -i $FILE ;;
-              loadgenerator)
-                yq e ".loadGenerator.image.tag = \"$TAG\"" -i $FILE ;;
-              paymentservice)
-                yq e ".paymentService.image.tag = \"$TAG\"" -i $FILE ;;
-              productcatalogservice)
-                yq e ".productCatalogService.image.tag = \"$TAG\"" -i $FILE ;;
-              recommendationservice)
-                yq e ".recommendationService.image.tag = \"$TAG\"" -i $FILE ;;
-              shippingservice)
-                yq e ".shippingService.image.tag = \"$TAG\"" -i $FILE ;;
-              *)
-                echo "Skipping unknown service: $SERVICE" ;;
+            case "$SERVICE" in
+              adservice)                KEY="adService" ;;
+              cartservice)              KEY="cartService" ;;
+              checkoutservice)          KEY="checkoutService" ;;
+              currencyservice)          KEY="currencyService" ;;
+              emailservice)             KEY="emailService" ;;
+              frontend)                 KEY="frontend" ;;
+              loadgenerator)            KEY="loadGenerator" ;;
+              paymentservice)           KEY="paymentService" ;;
+              productcatalogservice)    KEY="productCatalogService" ;;
+              recommendationservice)    KEY="recommendationService" ;;
+              shippingservice)         KEY="shippingService" ;;
+              shoppingassistantservice) KEY="shoppingAssistantService" ;;
+              *)                        KEY="" ;;
             esac
-          done
+
+            if [[ -n "$KEY" ]]; then
+              echo "Updating $SERVICE -> $KEY to tag $TAG"
+              yq e ".${KEY}.image.tag = \"${TAG}\"" -i "$FILE"
+            else
+              echo "Skipping unknown service: $SERVICE"
+            fi
+          done < <(echo "$SERVICES" | jq -r '.[]')
 
       - name: Commit and push changes
+        shell: bash
         working-directory: deploy-repo
         run: |
+          set -euo pipefail
+
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
 
-          git add ${{ vars.DEPLOYMENT_REPO_PATH }}
+          git add "${{ vars.DEPLOYMENT_REPO_PATH }}"
 
           if git diff --cached --quiet; then
             echo "No changes to commit"
           else
             git commit -m "Update image tags to ${{ github.sha }}"
-            git push origin ${{ vars.DEPLOYMENT_REPO_BRANCH }}
+            git push origin "${{ vars.DEPLOYMENT_REPO_BRANCH }}"
           fi
