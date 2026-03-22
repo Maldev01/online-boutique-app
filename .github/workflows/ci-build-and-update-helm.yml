@@ -4,12 +4,12 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 permissions:
   id-token: write
   contents: read
   packages: write
-      
 
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
@@ -17,9 +17,9 @@ env:
 
 jobs:
 
-# 🔍 1. Detect Changed Services
+# 🔍 1. Detect Changed + New Services
   detect-changes:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted]
     outputs:
       services: ${{ steps.set-matrix.outputs.services }}
 
@@ -27,32 +27,73 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
-          fetch-depth: 2
-      - name: Get changed services
+          fetch-depth: 0   # full history (important)
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Detect services dynamically
         id: set-matrix
         run: |
-          ALL_SERVICES=("adservice" "cartservice" "checkoutservice" "currencyservice" "emailservice" "frontend" "loadgenerator" "paymentservice" "productcatalogservice" "recommendationservice" "shippingservice")
+          echo "🔍 Detecting services..."
 
+          # Changed + new files
           CHANGED_FILES=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }})
+          NEW_FILES=$(git diff --name-only --diff-filter=A ${{ github.event.before }} ${{ github.sha }})
+
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+
+          echo "New files:"
+          echo "$NEW_FILES"
 
           SERVICES=()
 
-          for SERVICE in "${ALL_SERVICES[@]}"; do
-          if echo "$CHANGED_FILES" | grep -q "^$SERVICE/"; then
-          SERVICES+=("\"$SERVICE\"")
-          fi
+          # Extract top-level directories
+          ALL_DIRS=$(echo "$CHANGED_FILES $NEW_FILES" | tr ' ' '\n' | cut -d/ -f1 | sort -u)
+
+          for DIR in $ALL_DIRS; do
+            # Skip invalid folders
+            if [[ "$DIR" == ".github" || "$DIR" == "" || "$DIR" == "README.md" ]]; then
+              continue
+            fi
+
+            # Check if valid service (Dockerfile exists)
+            if [ -f "$DIR/Dockerfile" ]; then
+              SERVICES+=("\"$DIR\"")
+            fi
           done
 
-          JSON=$(printf '[%s]' "$(IFS=,; echo "${SERVICES[*]}")")
+          # 🔥 Ensure build if image missing in ECR
+          for DIR in $ALL_DIRS; do
+            if [ -f "$DIR/Dockerfile" ]; then
+              if ! aws ecr describe-images --repository-name $DIR --region $AWS_REGION > /dev/null 2>&1; then
+                echo "⚠️ Missing image in ECR → forcing build for $DIR"
+                SERVICES+=("\"$DIR\"")
+              fi
+            fi
+          done
 
-          echo "Detected services: $JSON"
+          # Remove duplicates
+          UNIQUE=$(printf "%s\n" "${SERVICES[@]}" | sort -u | tr '\n' ',' | sed 's/,$//')
+
+          if [ -z "$UNIQUE" ]; then
+            JSON="[]"
+          else
+            JSON="[$UNIQUE]"
+          fi
+
+          echo "✅ Final detected services: $JSON"
           echo "services=$JSON" >> $GITHUB_OUTPUT
 
-# 🐳 2. Build & Push Images to ECR
+# 🐳 2. Build & Push Images
   build-and-push:
     needs: detect-changes
     if: ${{ needs.detect-changes.outputs.services != '[]' }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted]
 
     strategy:
       matrix:
@@ -78,16 +119,16 @@ jobs:
           SERVICE=${{ matrix.service }}
           TAG=${{ github.sha }}
 
-          echo "Building $SERVICE with tag $TAG"
+          echo "🚀 Building $SERVICE with tag $TAG"
 
           docker build -t $ECR_REGISTRY/$SERVICE:$TAG ./$SERVICE
           docker push $ECR_REGISTRY/$SERVICE:$TAG
 
-# 🔁 3. Update GitOps Repo (Per-Service Tag)
+# 🔁 3. Update GitOps Repo
   update-values:
     needs: [detect-changes, build-and-push]
     if: ${{ needs.build-and-push.result == 'success' && needs.detect-changes.outputs.services != '[]' }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted]
 
     steps:
       - name: Checkout GitOps repo
@@ -115,45 +156,33 @@ jobs:
           echo "Updating services: $SERVICES"
 
           for SERVICE in $(echo $SERVICES | jq -r '.[]'); do
-            echo "Processing $SERVICE"
+            echo "🔧 Updating $SERVICE"
 
             case $SERVICE in
               adservice)
-                yq e ".adService.image.tag = \"$TAG\"" -i $FILE
-                ;;
+                yq e ".adService.image.tag = \"$TAG\"" -i $FILE ;;
               cartservice)
-                yq e ".cartService.image.tag = \"$TAG\"" -i $FILE
-                ;;
+                yq e ".cartService.image.tag = \"$TAG\"" -i $FILE ;;
               checkoutservice)
-                yq e ".checkoutService.image.tag = \"$TAG\"" -i $FILE
-                ;;
+                yq e ".checkoutService.image.tag = \"$TAG\"" -i $FILE ;;
               currencyservice)
-                yq e ".currencyService.image.tag = \"$TAG\"" -i $FILE
-                ;;
+                yq e ".currencyService.image.tag = \"$TAG\"" -i $FILE ;;
               emailservice)
-                yq e ".emailService.image.tag = \"$TAG\"" -i $FILE
-                ;;
+                yq e ".emailService.image.tag = \"$TAG\"" -i $FILE ;;
               frontend)
-                yq e ".frontend.image.tag = \"$TAG\"" -i $FILE
-                ;;
+                yq e ".frontend.image.tag = \"$TAG\"" -i $FILE ;;
               loadgenerator)
-                yq e ".loadGenerator.image.tag = \"$TAG\"" -i $FILE
-                ;;
+                yq e ".loadGenerator.image.tag = \"$TAG\"" -i $FILE ;;
               paymentservice)
-                yq e ".paymentService.image.tag = \"$TAG\"" -i $FILE
-                ;;
+                yq e ".paymentService.image.tag = \"$TAG\"" -i $FILE ;;
               productcatalogservice)
-                yq e ".productCatalogService.image.tag = \"$TAG\"" -i $FILE
-                ;;
+                yq e ".productCatalogService.image.tag = \"$TAG\"" -i $FILE ;;
               recommendationservice)
-                yq e ".recommendationService.image.tag = \"$TAG\"" -i $FILE
-                ;;
+                yq e ".recommendationService.image.tag = \"$TAG\"" -i $FILE ;;
               shippingservice)
-                yq e ".shippingService.image.tag = \"$TAG\"" -i $FILE
-                ;;
+                yq e ".shippingService.image.tag = \"$TAG\"" -i $FILE ;;
               *)
-                echo "Skipping unknown service: $SERVICE"
-                ;;
+                echo "Skipping unknown service: $SERVICE" ;;
             esac
           done
 
