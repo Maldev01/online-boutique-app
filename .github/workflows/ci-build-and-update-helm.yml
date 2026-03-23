@@ -119,17 +119,31 @@ jobs:
         run: |
           aws ecr get-login-password --region "$AWS_REGION" \
             | docker login --username AWS --password-stdin "$ECR_REGISTRY"
-
-      - name: Build and push image
+ 
+      - name: Build image
         shell: bash
         run: |
           set -euo pipefail
           SERVICE="${{ matrix.service }}"
           TAG="${{ github.sha }}"
-
-          echo "Building ${SERVICE} with tag ${TAG}"
-
           docker build -t "$ECR_REGISTRY/$SERVICE:$TAG" "./src/$SERVICE"
+
+      - name: Trivy scan image
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: image
+          image-ref: ${{ env.ECR_REGISTRY }}/${{ matrix.service }}:${{ github.sha }}
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: 1    
+
+      - name: Push image
+        shell: bash
+        run: |
+          set -euo pipefail
+          SERVICE="${{ matrix.service }}"
+          TAG="${{ github.sha }}"
           docker push "$ECR_REGISTRY/$SERVICE:$TAG"
 
   update-values:
